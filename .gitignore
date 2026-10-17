@@ -1,0 +1,17 @@
+.history/
+.DS_Store
+
+# Rust & Python
+target/
+__pycache__/
+*.pyc
+.venv/
+dist/
+
+# Local Azurite Storage Emulator Data
+.azurite_data/
+
+# Terraform & Env
+.terraform/
+*.tfstate*
+.env
