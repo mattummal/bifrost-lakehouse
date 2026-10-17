@@ -1,14 +1,24 @@
-.PHONY: up down ingest logs clean
+.PHONY: up up-azurite down ingest transform clean
 
+# Default: Zero-dependency native local Delta Lake storage
 up:
+	mkdir -p .lakehouse_data/bronze .lakehouse_data/silver .lakehouse_data/gold
+	@echo "✓ Local Medallion Lakehouse initialized at ./.lakehouse_data/ (Zero-Docker mode)"
+
+# Optional: Run against Azurite container if Docker is installed
+up-azurite:
 	docker compose up -d
 
 down:
-	docker compose down
+	-docker compose down
 
 ingest:
+	@set -a; [ -f .env ] && . .env; set +a; \
 	cd crates/edge-ingester && cargo run --release
 
+transform:
+	@set -a; [ -f .env ] && . .env; set +a; \
+	uv run bifrost
+
 clean:
-	docker compose down -v
-	rm -rf .azurite_data
+	rm -rf .lakehouse_data .azurite_data

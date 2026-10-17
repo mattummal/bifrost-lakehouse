@@ -1,5 +1,6 @@
 .history/
 .DS_Store
+.vscode/
 
 # Rust & Python
 target/
@@ -8,8 +9,9 @@ __pycache__/
 .venv/
 dist/
 
-# Local Azurite Storage Emulator Data
+# Local Storage Backends (Native FS & Azurite Emulator)
 .azurite_data/
+.lakehouse_data/
 
 # Terraform & Env
 .terraform/
