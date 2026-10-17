@@ -1,0 +1,37 @@
+# Use Azurite to emulate Azure Blob / ADLS Gen2 storage locally,
+# alongside an init container using the Azure CLI to automatically
+# provision the bronze, silver, and gold storage containers on startup.
+services:
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    container_name: lakehouse-azurite
+    ports:
+      - "10000:10000" # Blob service (used by delta-rs & DuckDB)
+      - "10001:10001" # Queue service
+      - "10002:10002" # Table service
+    volumes:
+      - ./.azurite_data:/data
+    command: "azurite --blobHost 0.0.0.0 --queueHost 0.0.0.0 --tableHost 0.0.0.0 --skipApiVersionCheck"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "10000"]
+      interval: 2s
+      timeout: 5s
+      retries: 5
+
+  storage-init:
+    image: mcr.microsoft.com/azure-cli:latest
+    container_name: lakehouse-storage-init
+    depends_on:
+      azurite:
+        condition: service_healthy
+    environment:
+      # Standard well-known Azurite local connection string
+      AZURE_STORAGE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;"
+    entrypoint: >
+      /bin/sh -c "
+      echo 'Creating Medallion containers in local Azurite...';
+      az storage container create --name bronze;
+      az storage container create --name silver;
+      az storage container create --name gold;
+      echo 'Containers [bronze, silver, gold] ready.';
+      "
