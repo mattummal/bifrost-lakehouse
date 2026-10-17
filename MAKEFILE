@@ -1,0 +1,14 @@
+.PHONY: up down ingest logs clean
+
+up:
+	docker compose up -d
+
+down:
+	docker compose down
+
+ingest:
+	cd crates/edge-ingester && cargo run --release
+
+clean:
+	docker compose down -v
+	rm -rf .azurite_data

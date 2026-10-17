@@ -1,0 +1,21 @@
+[package]
+name = "edge-ingester"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.40", features = ["full"] }
+# tokio-tungstenite for low-latency WebSockets
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = "0.4"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Apache Arrow & Delta Lake with Azure Storage support
+# for columnar in-memory buffering & deltalake with the azure storage backend enabled
+arrow = { version = "53.2", features = ["prettyprint"] }
+deltalake = { version = "0.22", features = ["azure", "datafusion"] }
