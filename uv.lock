@@ -147,7 +147,6 @@ dependencies = [
     { name = "duckdb" },
     { name = "pyarrow" },
     { name = "rich" },
-    { name = "ruff" },
     { name = "sqlglot" },
 ]
 
@@ -172,7 +171,6 @@ requires-dist = [
     { name = "pyarrow", specifier = ">=17.0.0" },
     { name = "pyspark", marker = "extra == 'spark'", specifier = ">=3.5.0" },
     { name = "rich", specifier = ">=13.9.0" },
-    { name = "ruff", specifier = ">=0.17.1" },
     { name = "sqlglot", specifier = ">=25.0.0" },
 ]
 provides-extras = ["spark"]

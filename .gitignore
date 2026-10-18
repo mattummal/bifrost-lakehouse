@@ -17,3 +17,5 @@ dist/
 .terraform/
 *.tfstate*
 .env
+
+*.egg-info/
