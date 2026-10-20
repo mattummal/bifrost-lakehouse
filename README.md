@@ -69,24 +69,23 @@ Rather than serializing incoming JSON messages into intermediate row-based buffe
 
 ### 2. Data Contracts & Financial Anomaly Quarantine (`src/bifrost/pipeline.py`)
 High-frequency financial feeds exhibit network jitter, dropped frames, and momentary exchange matching anomalies. At the **Bronze $\rightarrow$ Silver** boundary, strict expectations are enforced:
-* **Crossed-Book Filter:** Rejects ticks where $\text{Bid}_{\text{best}} \ge \text{Ask}_{\text{best}}$.
+* **Crossed-Book Filter:** Rejects ticks where $$Bid_{\mathrm{best}} \ge Ask_{\mathrm{best}}$$.
 * **Dead-Letter Isolation:** Invalid records never halt the pipeline; they are atomically routed to `silver/orderbook_quarantine` with diagnostic metadata for post-mortem analysis.
 
 ### 3. Market Microstructure Feature Engineering (`Gold Layer`)
 Downstream analytical transformations compute quantitative liquidity metrics across tumbling windows:
 
 * **Order Book Imbalance (OBI):** Quantifies top-of-book buying vs. selling pressure:
-  $$\text{OBI} = \frac{Q_{\text{bid}} - Q_{\text{ask}}}{Q_{\text{bid}} + Q_{\text{ask}}} \in [-1, 1]$$
+  
+    $$\text{OBI} = \frac{Q_{\text{bid}} - Q_{\text{ask}}}{Q_{\text{bid}} + Q_{\text{ask}}} \in [-1, 1]$$
 
 * **Volume-Weighted Micro-Price ($P_{\text{micro}}$):** An instantaneous fair-value estimator weighted by inverse book depth:
-  $$P_{\text{micro}} = \frac{Q_{\text{bid}} \cdot P_{\text{ask}} + Q_{\text{ask}} \cdot P_{\text{bid}}}{Q_{\text{bid}} + Q_{\text{ask}}}$$
+  
+    $$P_{\text{micro}} = \frac{Q_{\text{bid}} \cdot P_{\text{ask}} + Q_{\text{ask}} \cdot P_{\text{bid}}}{Q_{\text{bid}} + Q_{\text{ask}}}$$
 
-* **Quoted Spread (Basis Points):**
-  $$
-  \text{Spread}_{\text{bps}} =
-  \frac{P_{\text{ask}} - P_{\text{bid}}}{P_{\text{mid}}}
-  \times 10^4
-  $$
+* **Quoted Spread (Basis Points):** The difference between the ask and bid prices expressed in basis points:
+  
+    $$Spread_{\mathrm{bps}} = \frac{P_{\mathrm{ask}} - P_{\mathrm{bid}}}{P_{\mathrm{mid}}} \times 10^4$$
 
 ---
 
