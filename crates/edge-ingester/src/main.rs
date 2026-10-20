@@ -135,7 +135,7 @@ async fn main() -> Result<()> {
                 }
             }
             _ = flush_timer.tick() => {
-                if buffer.len() > 0 {
+                if !buffer.is_empty() {
                     flush_to_delta(&mut buffer, &table_uri, &storage_opts).await?;
                 }
             }

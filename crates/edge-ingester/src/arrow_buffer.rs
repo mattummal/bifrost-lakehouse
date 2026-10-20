@@ -6,7 +6,7 @@ use std::sync::Arc;
 use deltalake::arrow::array::{
     Float64Builder, Int64Builder, StringBuilder, UInt64Builder,
 };
-use deltalake::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use deltalake::arrow::datatypes::{DataType, Field, Schema};
 use deltalake::arrow::record_batch::RecordBatch;
 use anyhow::Result;
 
@@ -77,6 +77,11 @@ impl ArrowOrderbookBuffer {
         self.row_count
     }
 
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.row_count == 0
+    }
+
     pub fn flush(&mut self) -> Result<RecordBatch> {
         let batch = RecordBatch::try_new(
             self.schema.clone(),
@@ -95,27 +100,47 @@ impl ArrowOrderbookBuffer {
         Ok(batch)
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::cast::AsArray;
-    use arrow_array::types::{Float64Type, Int64Type};
+    use deltalake::arrow::array::AsArray;
+    use deltalake::arrow::datatypes::{Float64Type, Int64Type, UInt64Type};
 
     #[test]
-    fn test_arrow_buffer_append_and_flush() {
-        let mut buffer = OrderBookArrowBuffer::new(10);
+    fn test_arrow_buffer_push_and_flush() {
+        let mut buffer = ArrowOrderbookBuffer::new(10);
         assert_eq!(buffer.len(), 0);
         assert!(buffer.is_empty());
 
-        // Append two valid ticks
-        buffer.append_tick("BTCUSDT", 1001, 50000.0, 1.5, 50001.0, 2.0, 1700000000000000);
-        buffer.append_tick("ETHUSDT", 2002, 3000.0, 10.0, 3000.5, 5.0, 1700000000000500);
+        // Push two valid ticks via OrderbookTick struct
+        buffer.push(&OrderbookTick {
+            exchange_ts_us: 1700000000000000,
+            ingest_ts_us: 1700000000000100,
+            symbol: "BTCUSDT".to_string(),
+            sequence_id: 1001,
+            best_bid_price: 50000.0,
+            best_bid_qty: 1.5,
+            best_ask_price: 50001.0,
+            best_ask_qty: 2.0,
+        });
+
+        buffer.push(&OrderbookTick {
+            exchange_ts_us: 1700000000000500,
+            ingest_ts_us: 1700000000000600,
+            symbol: "ETHUSDT".to_string(),
+            sequence_id: 2002,
+            best_bid_price: 3000.0,
+            best_bid_qty: 10.0,
+            best_ask_price: 3000.5,
+            best_ask_qty: 5.0,
+        });
 
         assert_eq!(buffer.len(), 2);
         assert!(!buffer.is_empty());
 
         // Flush into RecordBatch
-        let batch = buffer.flush_to_record_batch().expect("Failed to flush RecordBatch");
+        let batch = buffer.flush().expect("Failed to flush RecordBatch");
         assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 8);
 
@@ -123,16 +148,20 @@ mod tests {
         assert_eq!(buffer.len(), 0);
         assert!(buffer.is_empty());
 
-        // Verify columnar values inside the RecordBatch
-        let symbols = batch.column(0).as_string::<i32>();
+        // Verify columnar values inside the RecordBatch match field indices
+        let exch_ts = batch.column(0).as_primitive::<Int64Type>();
+        assert_eq!(exch_ts.value(0), 1700000000000000);
+        assert_eq!(exch_ts.value(1), 1700000000000500);
+
+        let symbols = batch.column(2).as_string::<i32>();
         assert_eq!(symbols.value(0), "BTCUSDT");
         assert_eq!(symbols.value(1), "ETHUSDT");
 
-        let update_ids = batch.column(1).as_primitive::<Int64Type>();
-        assert_eq!(update_ids.value(0), 1001);
-        assert_eq!(update_ids.value(1), 2002);
+        let seq_ids = batch.column(3).as_primitive::<UInt64Type>();
+        assert_eq!(seq_ids.value(0), 1001);
+        assert_eq!(seq_ids.value(1), 2002);
 
-        let bids = batch.column(2).as_primitive::<Float64Type>();
+        let bids = batch.column(4).as_primitive::<Float64Type>();
         assert_eq!(bids.value(0), 50000.0);
         assert_eq!(bids.value(1), 3000.0);
     }
