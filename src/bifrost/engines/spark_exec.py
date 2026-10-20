@@ -18,6 +18,18 @@ class SparkEngine:
         pass
 
     def run_transformations(self, storage_options: dict[str, str] | None = None) -> None:
+        # Auto-heal JAVA_HOME on macOS Apple Silicon if unset or pointing to a dead Coursier path
+        current_java = os.environ.get("JAVA_HOME", "")
+        if not current_java or "Coursier" in current_java or not Path(current_java).exists():
+            for candidate in [
+                "/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home",
+                "/opt/homebrew/opt/openjdk@21",
+                "/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home",
+                "/opt/homebrew/opt/openjdk@17",
+            ]:
+                if Path(candidate).exists():
+                    os.environ["JAVA_HOME"] = candidate
+                    break
         try:
             from delta import configure_spark_with_delta_pip
             from pyspark.sql import SparkSession
