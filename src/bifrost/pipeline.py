@@ -36,14 +36,14 @@ def run_medallion_pipeline(force_engine: str | None = None) -> None:
         FROM bronze_ticks
         WHERE best_bid_price > 0 AND best_ask_price > best_bid_price
           AND best_bid_qty > 0 AND best_ask_qty > 0
-    """).fetch_arrow_table()
+    """).to_arrow_table()
 
     quarantine_arrow = con.execute("""
         SELECT *, 'INVALID_ORDERBOOK' AS quarantine_reason
         FROM bronze_ticks
         WHERE NOT (best_bid_price > 0 AND best_ask_price > best_bid_price
                    AND best_bid_qty > 0 AND best_ask_qty > 0)
-    """).fetch_arrow_table()
+    """).to_arrow_table()
 
     write_deltalake(silver_valid_uri, valid_arrow, mode="overwrite", storage_options=storage_opts)
     if quarantine_arrow.num_rows > 0:
@@ -60,7 +60,7 @@ def run_medallion_pipeline(force_engine: str | None = None) -> None:
     if metrics.selected_engine == "duckdb":
         console.print("[bold yellow]🚀 Executing Fast Path via DuckDB Vectorized Engine...[/bold yellow]")
         duckdb_sql = get_gold_query(target_dialect="duckdb")
-        gold_arrow = con.execute(duckdb_sql).fetch_arrow_table()
+        gold_arrow = con.execute(duckdb_sql).to_arrow_table()
         write_deltalake(gold_bars_uri, gold_arrow, mode="overwrite", storage_options=storage_opts)
 
         elapsed_ms = (time.perf_counter() - t0) * 1000

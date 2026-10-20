@@ -9,47 +9,55 @@ from rich.table import Table
 
 console = Console()
 
-AZURITE_STORAGE_OPTIONS: dict[str, str] = {
-    "azure_storage_account_name": "devstoreaccount1",
-    "azure_storage_account_key": (
-        "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
-    ),
-    "azure_storage_use_emulator": "true",
-    "azure_storage_allow_http": "true",
-}
 
-
-def resolve_storage_target(layer: str, table: str) -> tuple[str, dict[str, str] | None]:
-    """Resolves URI and storage options across local_fs, azurite, and production Azure ADLS."""
-    backend = os.getenv("BIFROST_STORAGE", "local")
-    if backend == "azurite":
-        return f"az://{layer}/{table}", AZURITE_STORAGE_OPTIONS
-    elif backend == "azure":
-        return f"az://{layer}/{table}", {
-            "azure_storage_account_name": os.environ["AZURE_STORAGE_ACCOUNT_NAME"],
-        }
-    else:
-        repo_root = Path(__file__).resolve().parents[2]
-        target_dir = repo_root / ".lakehouse_data" / layer / table
-        target_dir.mkdir(parents=True, exist_ok=True)
-        return str(target_dir), None
-
-
-@dataclass
+@dataclass(frozen=True)
 class TableMetrics:
-    uri: str
-    version: int
-    file_count: int
+    table_uri: str
+    snapshot_version: int
+    num_files: int
     total_bytes: int
     selected_engine: str
     reason: str
 
 
-class BifrostRouter:
-    """Inspects Delta Lake transaction logs to route workloads between DuckDB and Spark."""
+def resolve_storage_target(layer: str, table_name: str) -> tuple[str, dict[str, str]]:
+    """
+    Resolves storage URI and credentials across Local, Azurite, and Azure ADLS Gen2.
+    """
+    backend = os.getenv("BIFROST_STORAGE", "local").lower()
 
-    def __init__(self, scale_threshold_gb: float = 25.0):
-        self.scale_threshold_bytes = int(scale_threshold_gb * (1024**3))
+    if backend == "azurite":
+        uri = f"az://{layer}/{table_name}"
+        opts = {
+            "account_name": os.getenv("AZURE_STORAGE_ACCOUNT_NAME", "devstoreaccount1"),
+            "account_key": ("Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="),
+            "use_emulator": "true",
+        }
+        return uri, opts
+
+    if backend == "azure":
+        account = os.environ["AZURE_STORAGE_ACCOUNT_NAME"]
+        uri = f"abfss://{layer}@{account}.dfs.core.windows.net/{table_name}"
+        opts = {"account_name": account, "use_azure_cli": "true"}
+        return uri, opts
+
+    # Default: Local filesystem lakehouse
+    base_dir = Path(os.getenv("BIFROST_DATA_DIR", ".lakehouse_data")).resolve()
+    target_path = base_dir / layer / table_name
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    return str(target_path), {}
+
+
+class BifrostRouter:
+    """
+    Cost-based adaptive compute router that inspects Delta Lake transaction log metadata
+    (_delta_log) to route between single-node vectorized execution (DuckDB) and
+    distributed execution (PySpark).
+    """
+
+    def __init__(self, duckdb_max_gb: float = 25.0, duckdb_max_files: int = 500) -> None:
+        self.duckdb_max_bytes = int(duckdb_max_gb * (1024**3))
+        self.duckdb_max_files = duckdb_max_files
 
     def inspect_and_route(
         self,
@@ -58,55 +66,69 @@ class BifrostRouter:
         force_engine: str | None = None,
     ) -> TableMetrics:
         dt = DeltaTable(table_uri, storage_options=storage_options)
-        actions_tbl = dt.get_add_actions(flatten=True)
+        version = dt.version()
 
-        # Safely convert arro3/PyArrow action table to a Python dictionary
+        actions_tbl = dt.get_add_actions(flatten=True)
         add_actions = pa.table(actions_tbl).to_pydict()
 
-        sizes = add_actions.get("size_bytes", [])
-        file_count = len(sizes)
-        total_bytes = sum(sizes)
+        sizes = add_actions.get("size_bytes") or add_actions.get("size") or []
+        num_files = len(sizes)
+        total_bytes = sum(int(s) for s in sizes if s is not None)
 
-        if force_engine:
-            selected = force_engine
-            reason = f"Explicitly forced via CLI (--engine={force_engine})"
-        elif total_bytes < self.scale_threshold_bytes:
-            selected = "duckdb"
+        env_force = force_engine or os.getenv("BIFROST_FORCE_ENGINE")
+
+        if env_force in ("duckdb", "pyspark"):
+            selected_engine = env_force
+            reason = f"Explicitly forced via CLI (--engine={env_force})"
+        elif total_bytes <= self.duckdb_max_bytes and num_files <= self.duckdb_max_files:
+            selected_engine = "duckdb"
             reason = (
-                f"Dataset ({total_bytes / (1024**2):.2f} MB across {file_count} files) "
-                f"< {self.scale_threshold_bytes / (1024**3):.0f} GB threshold -> In-Process Vectorized"
+                f"Fast path: Payload ({self._fmt_bytes(total_bytes)}, {num_files} files) "
+                f"fits in single-node vector memory (< {self.duckdb_max_bytes // (1024**3)} GB)"
             )
         else:
-            selected = "pyspark"
-            reason = "Dataset exceeds single-node memory threshold -> Distributed Shuffle"
+            selected_engine = "pyspark"
+            reason = (
+                f"Scale path: Payload ({self._fmt_bytes(total_bytes)}, {num_files} files) "
+                f"exceeds single-node threshold; routing to distributed Spark"
+            )
 
         metrics = TableMetrics(
-            uri=table_uri,
-            version=dt.version(),
-            file_count=file_count,
+            table_uri=table_uri,
+            snapshot_version=version,
+            num_files=num_files,
             total_bytes=total_bytes,
-            selected_engine=selected,
+            selected_engine=selected_engine,
             reason=reason,
         )
-        self._print_routing_decision(metrics)
+        self._render_decision_table(metrics)
         return metrics
 
     @staticmethod
-    def _print_routing_decision(m: TableMetrics) -> None:
-        table = Table(title="Bifrost Adaptive Compute Routing Decision", show_header=True)
-        table.add_column("Delta Table Target", style="cyan")
-        table.add_column("Snapshot Ver", justify="right")
-        table.add_column("Parquet Files", justify="right")
-        table.add_column("Payload Size", justify="right")
-        table.add_column("Target Engine", style="bold green")
-        table.add_column("Routing Heuristic")
+    def _fmt_bytes(num_bytes: int) -> str:
+        val = float(num_bytes)
+        for unit in ["B", "KB", "MB", "GB", "TB"]:
+            if val < 1024.0:
+                return f"{val:.1f} {unit}"
+            val /= 1024.0
+        return f"{val:.1f} PB"
 
-        short_uri = m.uri if m.uri.startswith("az://") else f".../{Path(m.uri).parent.name}/{Path(m.uri).name}"
+    @staticmethod
+    def _render_decision_table(m: TableMetrics) -> None:
+        table = Table(title="Bifrost Adaptive Compute Routing Decision", show_lines=True)
+        table.add_column("Delta Table Target", style="cyan")
+        table.add_column("Snapshot Ver", justify="right", style="magenta")
+        table.add_column("Parquet Files", justify="right", style="green")
+        table.add_column("Payload Size", justify="right", style="yellow")
+        table.add_column("Target Engine", style="bold red" if m.selected_engine == "pyspark" else "bold green")
+        table.add_column("Routing Heuristic", style="white")
+
+        short_uri = f".../{'/'.join(Path(m.table_uri).parts[-2:])}" if len(m.table_uri) > 30 else m.table_uri
         table.add_row(
             short_uri,
-            str(m.version),
-            str(m.file_count),
-            f"{m.total_bytes / 1024:.1f} KB",
+            str(m.snapshot_version),
+            str(m.num_files),
+            BifrostRouter._fmt_bytes(m.total_bytes),
             m.selected_engine.upper(),
             m.reason,
         )

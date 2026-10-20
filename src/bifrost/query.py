@@ -4,7 +4,7 @@ import sqlglot
 CANONICAL_GOLD_MICROSTRUCTURE_SQL = """
 SELECT
     symbol,
-    DATE_TRUNC('minute', to_timestamp(exchange_ts_us / 1000000.0)) AS window_start,
+    DATE_TRUNC('minute', to_timestamp(exchange_ts_us / 1000000.0)::TIMESTAMP) AS window_start,
     COUNT(*) AS tick_count,
     ROUND(AVG((best_bid_price + best_ask_price) / 2.0), 4) AS avg_mid_price,
     ROUND(AVG(
