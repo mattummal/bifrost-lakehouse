@@ -61,7 +61,13 @@ def run_medallion_pipeline(force_engine: str | None = None) -> None:
         console.print("[bold yellow]🚀 Executing Fast Path via DuckDB Vectorized Engine...[/bold yellow]")
         duckdb_sql = get_gold_query(target_dialect="duckdb")
         gold_arrow = con.execute(duckdb_sql).to_arrow_table()
-        write_deltalake(gold_bars_uri, gold_arrow, mode="overwrite", storage_options=storage_opts)
+        write_deltalake(
+            gold_bars_uri,
+            gold_arrow,
+            mode="overwrite",
+            schema_mode="overwrite",
+            storage_options=storage_opts,
+        )
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
         console.print(
