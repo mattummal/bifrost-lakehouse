@@ -82,7 +82,11 @@ Downstream analytical transformations compute quantitative liquidity metrics acr
   $$P_{\text{micro}} = \frac{Q_{\text{bid}} \cdot P_{\text{ask}} + Q_{\text{ask}} \cdot P_{\text{bid}}}{Q_{\text{bid}} + Q_{\text{ask}}}$$
 
 * **Quoted Spread (Basis Points):**
-  $$\text{Spread}_{\text{bps}} = \frac{P_{\text{ask}} - P_{\text{bid}}}{P_{\text{mid}}} \times 10^4$$
+  $$
+  \text{Spread}_{\text{bps}} =
+  \frac{P_{\text{ask}} - P_{\text{bid}}}{P_{\text{mid}}}
+  \times 10^4
+  $$
 
 ---
 
