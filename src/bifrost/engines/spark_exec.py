@@ -1,35 +1,18 @@
+import os
 import time
+from pathlib import Path
 
 from rich.console import Console
+from rich.syntax import Syntax
 
+from bifrost.query import get_gold_query
 from bifrost.router import resolve_storage_target
 
 console = Console()
 
-SPARK_GOLD_MICROSTRUCTURE_SQL = """
-SELECT
-    symbol,
-    date_trunc('minute', cast(from_unixtime(exchange_ts_us / 1000000.0) as timestamp)) AS window_start,
-    COUNT(*) AS tick_count,
-    ROUND(AVG((best_bid_price + best_ask_price) / 2.0), 4) AS avg_mid_price,
-    ROUND(AVG(
-        (best_bid_qty * best_ask_price + best_ask_qty * best_bid_price)
-        / NULLIF(best_bid_qty + best_ask_qty, 0.0)
-    ), 4) AS avg_vw_micro_price,
-    ROUND(AVG(
-        ((best_ask_price - best_bid_price) / ((best_bid_price + best_ask_price) / 2.0)) * 10000.0
-    ), 4) AS avg_spread_bps,
-    ROUND(AVG(
-        (best_bid_qty - best_ask_qty) / NULLIF(best_bid_qty + best_ask_qty, 0.0)
-    ), 4) AS avg_orderbook_imbalance
-FROM silver_ticks
-GROUP BY 1, 2
-ORDER BY window_start DESC, symbol
-"""
-
 
 class SparkEngine:
-    """Distributed Scale-Path Engine utilizing PySpark and Delta-Spark."""
+    """Distributed Scale-Path Engine utilising PySpark and Delta-Spark."""
 
     def __init__(self) -> None:
         pass
@@ -48,17 +31,43 @@ class SparkEngine:
         t0 = time.perf_counter()
         console.print("[bold blue]⚡ Initializing PySpark Distributed Cluster Session...[/bold blue]")
 
+        # Transpile DuckDB SQL -> Spark SQL via SQLGlot AST
+        spark_sql = get_gold_query(target_dialect="spark")
+        console.print("[dim]🔄 SQLGlot Transpiled Query (DuckDB -> Spark SQL):[/dim]")
+        console.print(Syntax(spark_sql, "sql", theme="monokai", word_wrap=True))
+
+        # Java 17/21 module flags required by Apache Spark & Arrow
+        jvm_opts = (
+            "--add-opens=java.base/java.lang=ALL-UNNAMED "
+            "--add-opens=java.base/java.lang.invoke=ALL-UNNAMED "
+            "--add-opens=java.base/java.lang.reflect=ALL-UNNAMED "
+            "--add-opens=java.base/java.io=ALL-UNNAMED "
+            "--add-opens=java.base/java.net=ALL-UNNAMED "
+            "--add-opens=java.base/java.nio=ALL-UNNAMED "
+            "--add-opens=java.base/java.util=ALL-UNNAMED "
+            "--add-opens=java.base/java.util.concurrent=ALL-UNNAMED "
+            "--add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED "
+            "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED "
+            "--add-opens=java.base/sun.nio.cs=ALL-UNNAMED "
+            "--add-opens=java.base/sun.security.action=ALL-UNNAMED "
+            "--add-opens=java.base/sun.util.calendar=ALL-UNNAMED"
+        )
+
         builder = (
             SparkSession.builder.appName("Bifrost-ScaleEngine-PySpark")
             .master("local[*]")
+            .config("spark.driver.extraJavaOptions", jvm_opts)
+            .config("spark.executor.extraJavaOptions", jvm_opts)
             .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
             .config(
                 "spark.sql.catalog.spark_catalog",
                 "org.apache.spark.sql.delta.catalog.DeltaCatalog",
             )
+            .config("spark.ui.showConsoleProgress", "false")
         )
 
         spark = configure_spark_with_delta_pip(builder).getOrCreate()
+        spark.sparkContext.setLogLevel("ERROR")
 
         silver_valid_uri, _ = resolve_storage_target("silver", "orderbook_validated")
         gold_bars_uri, _ = resolve_storage_target("gold", "microstructure_1m")
@@ -68,7 +77,7 @@ class SparkEngine:
         df_silver.createOrReplaceTempView("silver_ticks")
 
         console.print("[cyan]Executing Microstructure Aggregations via Spark SQL...[/cyan]")
-        df_gold = spark.sql(SPARK_GOLD_MICROSTRUCTURE_SQL)
+        df_gold = spark.sql(spark_sql)
 
         # Write Delta Lake Gold table
         df_gold.write.format("delta").mode("overwrite").save(gold_bars_uri)
