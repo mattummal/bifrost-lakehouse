@@ -77,7 +77,6 @@ impl ArrowOrderbookBuffer {
         self.row_count
     }
 
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.row_count == 0
     }
