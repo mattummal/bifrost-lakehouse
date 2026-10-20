@@ -95,3 +95,45 @@ impl ArrowOrderbookBuffer {
         Ok(batch)
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{Float64Type, Int64Type};
+
+    #[test]
+    fn test_arrow_buffer_append_and_flush() {
+        let mut buffer = OrderBookArrowBuffer::new(10);
+        assert_eq!(buffer.len(), 0);
+        assert!(buffer.is_empty());
+
+        // Append two valid ticks
+        buffer.append_tick("BTCUSDT", 1001, 50000.0, 1.5, 50001.0, 2.0, 1700000000000000);
+        buffer.append_tick("ETHUSDT", 2002, 3000.0, 10.0, 3000.5, 5.0, 1700000000000500);
+
+        assert_eq!(buffer.len(), 2);
+        assert!(!buffer.is_empty());
+
+        // Flush into RecordBatch
+        let batch = buffer.flush_to_record_batch().expect("Failed to flush RecordBatch");
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_columns(), 8);
+
+        // Verify buffer is reset after flush
+        assert_eq!(buffer.len(), 0);
+        assert!(buffer.is_empty());
+
+        // Verify columnar values inside the RecordBatch
+        let symbols = batch.column(0).as_string::<i32>();
+        assert_eq!(symbols.value(0), "BTCUSDT");
+        assert_eq!(symbols.value(1), "ETHUSDT");
+
+        let update_ids = batch.column(1).as_primitive::<Int64Type>();
+        assert_eq!(update_ids.value(0), 1001);
+        assert_eq!(update_ids.value(1), 2002);
+
+        let bids = batch.column(2).as_primitive::<Float64Type>();
+        assert_eq!(bids.value(0), 50000.0);
+        assert_eq!(bids.value(1), 3000.0);
+    }
+}
