@@ -1,34 +1,15 @@
 import time
 
 import duckdb
+import pyarrow as pa
 from deltalake import DeltaTable, write_deltalake
 from rich.console import Console
 
 from bifrost.engines.spark_exec import SparkEngine
+from bifrost.query import get_gold_query
 from bifrost.router import BifrostRouter, resolve_storage_target
 
 console = Console()
-
-DUCKDB_GOLD_MICROSTRUCTURE_SQL = """
-SELECT
-    symbol,
-    time_bucket(INTERVAL '1 minute', to_timestamp(exchange_ts_us / 1000000.0)) AS window_start,
-    COUNT(*) AS tick_count,
-    ROUND(AVG((best_bid_price + best_ask_price) / 2.0), 4) AS avg_mid_price,
-    ROUND(AVG(
-        (best_bid_qty * best_ask_price + best_ask_qty * best_bid_price)
-        / NULLIF(best_bid_qty + best_ask_qty, 0)
-    ), 4) AS avg_vw_micro_price,
-    ROUND(AVG(
-        ((best_ask_price - best_bid_price) / ((best_bid_price + best_ask_price) / 2.0)) * 10000.0
-    ), 4) AS avg_spread_bps,
-    ROUND(AVG(
-        (best_bid_qty - best_ask_qty) / NULLIF(best_bid_qty + best_ask_qty, 0)
-    ), 4) AS avg_orderbook_imbalance
-FROM silver_ticks
-GROUP BY 1, 2
-ORDER BY window_start DESC, symbol
-"""
 
 
 def run_medallion_pipeline(force_engine: str | None = None) -> None:
@@ -43,9 +24,9 @@ def run_medallion_pipeline(force_engine: str | None = None) -> None:
     # 1. Inspect Bronze Delta Log & Determine Route
     metrics = router.inspect_and_route(bronze_uri, storage_options=storage_opts, force_engine=force_engine)
 
-    # 2. Always run Silver ingestion contract validation via DuckDB/Arrow (Fast single-node validation)
+    # 2. Run Silver ingestion contract validation via DuckDB/Arrow
     bronze_dt = DeltaTable(bronze_uri, storage_options=storage_opts)
-    bronze_arrow = bronze_dt.to_pyarrow_table()
+    bronze_arrow = pa.table(bronze_dt.to_pyarrow_table())
 
     con = duckdb.connect()
     con.register("bronze_ticks", bronze_arrow)
@@ -78,7 +59,8 @@ def run_medallion_pipeline(force_engine: str | None = None) -> None:
 
     if metrics.selected_engine == "duckdb":
         console.print("[bold yellow]🚀 Executing Fast Path via DuckDB Vectorized Engine...[/bold yellow]")
-        gold_arrow = con.execute(DUCKDB_GOLD_MICROSTRUCTURE_SQL).fetch_arrow_table()
+        duckdb_sql = get_gold_query(target_dialect="duckdb")
+        gold_arrow = con.execute(duckdb_sql).fetch_arrow_table()
         write_deltalake(gold_bars_uri, gold_arrow, mode="overwrite", storage_options=storage_opts)
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
