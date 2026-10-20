@@ -1,15 +1,15 @@
 import time
 
 import duckdb
-import sqlglot
 from deltalake import DeltaTable, write_deltalake
 from rich.console import Console
 
+from bifrost.engines.spark_exec import SparkEngine
 from bifrost.router import BifrostRouter, resolve_storage_target
 
 console = Console()
 
-GOLD_MICROSTRUCTURE_SQL = """
+DUCKDB_GOLD_MICROSTRUCTURE_SQL = """
 SELECT
     symbol,
     time_bucket(INTERVAL '1 minute', to_timestamp(exchange_ts_us / 1000000.0)) AS window_start,
@@ -40,71 +40,54 @@ def run_medallion_pipeline(force_engine: str | None = None) -> None:
     silver_quarantine_uri, _ = resolve_storage_target("silver", "orderbook_quarantine")
     gold_bars_uri, _ = resolve_storage_target("gold", "microstructure_1m")
 
-    # 1. Inspect Bronze Delta Log & Route Compute
-    router.inspect_and_route(bronze_uri, storage_options=storage_opts, force_engine=force_engine)
+    # 1. Inspect Bronze Delta Log & Determine Route
+    metrics = router.inspect_and_route(bronze_uri, storage_options=storage_opts, force_engine=force_engine)
 
-    # 2. Load Bronze Snapshot into Zero-Copy Arrow Dataset
+    # 2. Always run Silver ingestion contract validation via DuckDB/Arrow (Fast single-node validation)
     bronze_dt = DeltaTable(bronze_uri, storage_options=storage_opts)
     bronze_arrow = bronze_dt.to_pyarrow_table()
 
     con = duckdb.connect()
     con.register("bronze_ticks", bronze_arrow)
 
-    # 3. Enforce Silver Data Contracts (Valid vs. Quarantine)
     valid_arrow = con.execute("""
-        SELECT *,
-               (best_bid_price + best_ask_price) / 2.0 AS mid_price
+        SELECT *, (best_bid_price + best_ask_price) / 2.0 AS mid_price
         FROM bronze_ticks
-        WHERE best_bid_price > 0
-          AND best_ask_price > best_bid_price
-          AND best_bid_qty > 0
-          AND best_ask_qty > 0
+        WHERE best_bid_price > 0 AND best_ask_price > best_bid_price
+          AND best_bid_qty > 0 AND best_ask_qty > 0
     """).fetch_arrow_table()
 
     quarantine_arrow = con.execute("""
-        SELECT *,
-               CASE
-                   WHEN best_ask_price <= best_bid_price THEN 'CROSSED_OR_LOCKED_BOOK'
-                   WHEN best_bid_price <= 0 OR best_ask_price <= 0 THEN 'NON_POSITIVE_PRICE'
-                   ELSE 'NON_POSITIVE_LIQUIDITY'
-               END AS quarantine_reason
+        SELECT *, 'INVALID_ORDERBOOK' AS quarantine_reason
         FROM bronze_ticks
-        WHERE NOT (
-            best_bid_price > 0
-            AND best_ask_price > best_bid_price
-            AND best_bid_qty > 0
-            AND best_ask_qty > 0
-        )
+        WHERE NOT (best_bid_price > 0 AND best_ask_price > best_bid_price
+                   AND best_bid_qty > 0 AND best_ask_qty > 0)
     """).fetch_arrow_table()
 
     write_deltalake(silver_valid_uri, valid_arrow, mode="overwrite", storage_options=storage_opts)
     if quarantine_arrow.num_rows > 0:
-        write_deltalake(
-            silver_quarantine_uri,
-            quarantine_arrow,
-            mode="append",
-            storage_options=storage_opts,
-        )
+        write_deltalake(silver_quarantine_uri, quarantine_arrow, mode="append", storage_options=storage_opts)
 
     console.print(
         f"[green]✓ Silver Contract Enforced:[/green] {valid_arrow.num_rows} valid rows | "
         f"{quarantine_arrow.num_rows} quarantined."
     )
 
-    # 4. Gold Market Microstructure Aggregation
+    # 3. Route Gold Microstructure Aggregations based on router metrics
     con.register("silver_ticks", valid_arrow)
-    gold_arrow = con.execute(GOLD_MICROSTRUCTURE_SQL).fetch_arrow_table()
 
-    write_deltalake(gold_bars_uri, gold_arrow, mode="overwrite", storage_options=storage_opts)
+    if metrics.selected_engine == "duckdb":
+        console.print("[bold yellow]🚀 Executing Fast Path via DuckDB Vectorized Engine...[/bold yellow]")
+        gold_arrow = con.execute(DUCKDB_GOLD_MICROSTRUCTURE_SQL).fetch_arrow_table()
+        write_deltalake(gold_bars_uri, gold_arrow, mode="overwrite", storage_options=storage_opts)
 
-    elapsed_ms = (time.perf_counter() - t0) * 1000
-    console.print(
-        f"[bold green]✓ Gold Microstructure Bars Committed:[/bold green] "
-        f"{gold_arrow.num_rows} bars written in {elapsed_ms:.1f} ms\n"
-    )
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        console.print(
+            f"[bold green]✓ DuckDB Gold Path Complete:[/bold green] {gold_arrow.num_rows} bars in {elapsed_ms:.1f} ms\n"
+        )
+        con.sql("SELECT * FROM gold_arrow LIMIT 10").show()
 
-    con.sql("SELECT * FROM gold_arrow LIMIT 10").show()
-
-    spark_sql = sqlglot.transpile(GOLD_MICROSTRUCTURE_SQL, read="duckdb", write="spark")[0]
-    console.print("[dim]Transpiled Spark SQL AST (Ready for Databricks Scale Path):[/dim]")
-    console.print(f"[dim]{spark_sql}[/dim]")
+    else:
+        console.print("[bold magenta]🌐 Executing Scale Path via PySpark Distributed Engine...[/bold magenta]")
+        spark_engine = SparkEngine()
+        spark_engine.run_transformations(storage_options=storage_opts)

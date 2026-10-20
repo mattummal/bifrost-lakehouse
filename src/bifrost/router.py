@@ -2,6 +2,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+import pyarrow as pa
 from deltalake import DeltaTable
 from rich.console import Console
 from rich.table import Table
@@ -57,7 +58,10 @@ class BifrostRouter:
         force_engine: str | None = None,
     ) -> TableMetrics:
         dt = DeltaTable(table_uri, storage_options=storage_options)
-        add_actions = dt.get_add_actions(flatten=True).to_pydict()
+        actions_tbl = dt.get_add_actions(flatten=True)
+
+        # Safely convert arro3/PyArrow action table to a Python dictionary
+        add_actions = pa.table(actions_tbl).to_pydict()
 
         sizes = add_actions.get("size_bytes", [])
         file_count = len(sizes)
@@ -97,11 +101,7 @@ class BifrostRouter:
         table.add_column("Target Engine", style="bold green")
         table.add_column("Routing Heuristic")
 
-        short_uri = (
-            m.uri
-            if m.uri.startswith("az://")
-            else f".../{Path(m.uri).parent.name}/{Path(m.uri).name}"
-        )
+        short_uri = m.uri if m.uri.startswith("az://") else f".../{Path(m.uri).parent.name}/{Path(m.uri).name}"
         table.add_row(
             short_uri,
             str(m.version),
