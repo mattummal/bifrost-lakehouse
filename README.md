@@ -69,7 +69,7 @@ Rather than serializing incoming JSON messages into intermediate row-based buffe
 
 ### 2. Data Contracts & Financial Anomaly Quarantine (`src/bifrost/pipeline.py`)
 High-frequency financial feeds exhibit network jitter, dropped frames, and momentary exchange matching anomalies. At the **Bronze $\rightarrow$ Silver** boundary, strict expectations are enforced:
-* **Crossed-Book Filter:** Rejects ticks where $$Bid_{\mathrm{best}} \ge Ask_{\mathrm{best}}$$.
+* **Crossed-Book Filter:** Rejects ticks where $$Bid_{\mathrm{best}} \ge Ask_{\mathrm{best}}$$
 * **Dead-Letter Isolation:** Invalid records never halt the pipeline; they are atomically routed to `silver/orderbook_quarantine` with diagnostic metadata for post-mortem analysis.
 
 ### 3. Market Microstructure Feature Engineering (`Gold Layer`)
