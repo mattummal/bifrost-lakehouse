@@ -146,6 +146,7 @@ bifrost-lakehouse/
 ├── src/
 │   └── bifrost/                # Python control plane & transformation package
 │       ├── cli.py              # CLI argument parser entrypoint
+│       ├── query.py            # Canonical Gold Microstructure Query authored in DuckDB dialect
 │       ├── router.py           # Delta log inspector & cost-based engine selector
 │       ├── pipeline.py         # Medallion data contract & transformation orchestrator
 │       └── engines/
