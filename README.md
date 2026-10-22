@@ -76,15 +76,15 @@ High-frequency financial feeds exhibit network jitter, dropped frames, and momen
 Downstream analytical transformations compute quantitative liquidity metrics across tumbling windows:
 
 * **Order Book Imbalance (OBI):** Quantifies top-of-book buying vs. selling pressure:
-  
+
     $$\text{OBI} = \frac{Q_{\text{bid}} - Q_{\text{ask}}}{Q_{\text{bid}} + Q_{\text{ask}}} \in [-1, 1]$$
 
 * **Volume-Weighted Micro-Price ($P_{\text{micro}}$):** An instantaneous fair-value estimator weighted by inverse book depth:
-  
+
     $$P_{\text{micro}} = \frac{Q_{\text{bid}} \cdot P_{\text{ask}} + Q_{\text{ask}} \cdot P_{\text{bid}}}{Q_{\text{bid}} + Q_{\text{ask}}}$$
 
 * **Quoted Spread (Basis Points):** The difference between the ask and bid prices expressed in basis points:
-  
+
     $$Spread_{\mathrm{bps}} = \frac{P_{\mathrm{ask}} - P_{\mathrm{bid}}}{P_{\mathrm{mid}}} \times 10^4$$
 
 ---
@@ -151,7 +151,7 @@ bifrost-lakehouse/
 │       ├── pipeline.py         # Medallion data contract & transformation orchestrator
 │       └── engines/
 │           └── spark_exec.py   # Distributed PySpark & Delta-Spark scale-path backend
-├── terraform/                  # Production Azure IaC (ADLS Gen2, Container Apps, RBAC)
+├── infra/                      # Production Azure IaC (ADLS Gen2, Container Apps, RBAC)
 └── docs/
     └── adr/                    # Architecture Decision Records
         ├── 001-rust-arrow-edge-compaction.md
