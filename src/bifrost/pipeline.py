@@ -1,15 +1,68 @@
 import time
+from typing import Any
 
 import duckdb
 import pyarrow as pa
 from deltalake import DeltaTable, write_deltalake
 from rich.console import Console
+from soda.scan import Scan
 
 from bifrost.engines.spark_exec import SparkEngine
 from bifrost.query import get_gold_query
 from bifrost.router import BifrostRouter, resolve_storage_target
 
 console = Console()
+
+
+def run_bifrost_soda_validation(storage_options: dict[str, Any] | None = None) -> bool:
+    import os
+
+    db_path = "soda_eval.duckdb"
+
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    con = duckdb.connect(db_path)
+
+    bronze_dt = DeltaTable(".lakehouse_data/bronze/orderbook_bbo", storage_options=storage_options)
+    silver_dt = DeltaTable(".lakehouse_data/silver/orderbook_validated", storage_options=storage_options)
+    gold_dt = DeltaTable(".lakehouse_data/gold/microstructure_1m", storage_options=storage_options)
+
+    con.register("bronze_arrow", bronze_dt.to_pyarrow_dataset())
+    con.register("silver_arrow", silver_dt.to_pyarrow_dataset())
+    con.register("gold_arrow", gold_dt.to_pyarrow_dataset())
+
+    con.execute("CREATE OR REPLACE TABLE bronze_orderbook_bbo AS SELECT * FROM bronze_arrow")
+    con.execute("CREATE OR REPLACE TABLE silver_orderbook_validated AS SELECT * FROM silver_arrow")
+    con.execute("CREATE OR REPLACE TABLE gold_microstructure_1m AS SELECT * FROM gold_arrow")
+    con.close()
+
+    scan = Scan()
+    scan.set_data_source_name("bifrost_duckdb")
+
+    # Use 'path:' instead of 'database:'
+    config_yaml = f"""
+        data_source bifrost_duckdb:
+          type: duckdb
+          path: '{db_path}'
+    """
+    scan.add_configuration_yaml_str(config_yaml)
+    scan.add_sodacl_yaml_file("bifrost_contract.yml")
+
+    scan.execute()
+    print(scan.get_logs_text())
+
+    # Clean up temporary database files
+    if os.path.exists(db_path):
+        os.remove(db_path)
+    if os.path.exists(f"{db_path}.wal"):
+        os.remove(f"{db_path}.wal")
+
+    # Fail if there are execution errors or check failures
+    if scan.has_error_logs():
+        return False
+
+    return not scan.has_check_fails()
 
 
 def run_medallion_pipeline(force_engine: str | None = None) -> None:
@@ -79,3 +132,12 @@ def run_medallion_pipeline(force_engine: str | None = None) -> None:
         console.print("[bold magenta]🌐 Executing Scale Path via PySpark Distributed Engine...[/bold magenta]")
         spark_engine = SparkEngine()
         spark_engine.run_transformations(storage_options=storage_opts)
+
+    # 4. Run Soda Core Multi-Tier Data Contracts across Bronze, Silver, and Gold
+    console.print("\n[bold cyan]🔍 Executing Soda Core Data Contract Validation across all tiers...[/bold cyan]")
+    contracts_passed = run_bifrost_soda_validation(storage_options=storage_opts)
+
+    if not contracts_passed:
+        raise RuntimeError("❌ Soda Core data contract validation failed! Check logs above.")
+
+    console.print("[bold green]✓ All Data Contracts Passed Successfully![/bold green]")

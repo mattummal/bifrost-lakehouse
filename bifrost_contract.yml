@@ -1,0 +1,45 @@
+# in Bifrost, we enforce contracts end-to-end across the Medallion architecture.
+# While Bronze checks focus on ingestion health and schema integrity,
+# Silver validates financial market physics (such as uncrossed bid-ask books),
+# and Gold safeguards analytical integrity by asserting primary key uniqueness
+# and metric bounds before downstream quantitative models consume the data.
+
+# --- 1. BRONZE TIER: Intake & Freshness ---
+checks for bronze_orderbook_bbo:
+  - row_count > 0:
+      name: "Bronze table must contain ingested ticks"
+  - missing_count(symbol) = 0:
+      name: "Symbol must never be null in raw feed"
+  - missing_count(exchange_ts_us) = 0:
+      name: "Exchange timestamp must be present"
+
+# --- 2. SILVER TIER: Domain Physics & Data Cleanliness ---
+checks for silver_orderbook_validated:
+  - row_count > 0:
+      name: "Silver table must contain validated ticks"
+  - missing_count(symbol) = 0:
+      name: "Validated symbol cannot be null"
+  - failed rows:
+      name: "Bids must be strictly positive"
+      fail condition: best_bid_price <= 0
+  - failed rows:
+      name: "Uncrossed book contract: Ask must exceed Bid"
+      fail condition: best_ask_price <= best_bid_price
+  - duplicate_count(sequence_id, symbol) = 0:
+      name: "No duplicate sequence IDs per symbol"
+
+# --- 3. GOLD TIER: Analytical Invariants & Bounds ---
+checks for gold_microstructure_1m:
+  - row_count > 0:
+      name: "Gold table must contain aggregated bars"
+  - failed rows:
+      name: "Tick count per minute must be positive"
+      fail condition: tick_count <= 0
+  - failed rows:
+      name: "Average mid-price must be positive"
+      fail condition: avg_mid_price <= 0
+  - failed rows:
+      name: "Spread in basis points cannot be negative"
+      fail condition: avg_spread_bps < 0
+  - duplicate_count(window_start, symbol) = 0:
+      name: "Primary key uniqueness: One bar per symbol per minute window"
