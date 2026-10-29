@@ -2,51 +2,11 @@ from pathlib import Path
 
 import duckdb
 import pyarrow as pa
-import pytest
-from deltalake import DeltaTable, write_deltalake
+from deltalake import DeltaTable
 
 from bifrost.pipeline import run_medallion_pipeline
 from bifrost.query import get_gold_query
 from bifrost.router import BifrostRouter
-
-
-@pytest.fixture
-def sample_bronze_delta_table(tmp_path: Path) -> Path:
-    """
-    Creates an isolated Bronze Delta table containing both valid orderbook ticks
-    and anomalous ticks (crossed book & zero quantity) to test quarantine contracts.
-    """
-    bronze_dir = tmp_path / "bronze" / "orderbook_bbo"
-    bronze_dir.mkdir(parents=True, exist_ok=True)
-
-    # 3 valid ticks + 2 invalid ticks (1 crossed book where bid >= ask, 1 zero qty)
-    data = pa.table(
-        {
-            "symbol": ["BTCUSDT", "BTCUSDT", "ETHUSDT", "BTCUSDT", "ETHUSDT"],
-            "update_id": [101, 102, 201, 103, 202],
-            "best_bid_price": [60000.0, 60010.0, 3000.0, 60050.0, 3000.0],
-            "best_bid_qty": [2.0, 3.0, 10.0, 1.0, 0.0],  # Row 4 has 0.0 bid qty (invalid)
-            "best_ask_price": [60010.0, 60020.0, 3003.0, 60000.0, 3001.0],  # Row 3 bid > ask (crossed)
-            "best_ask_qty": [2.0, 1.0, 10.0, 1.0, 5.0],
-            "exchange_ts_us": [
-                1729190000000000,
-                1729190010000000,
-                1729190015000000,
-                1729190020000000,
-                1729190025000000,
-            ],
-            "ingest_ts_us": [
-                1729190000001000,
-                1729190010001000,
-                1729190015001000,
-                1729190020001000,
-                1729190025001000,
-            ],
-        }
-    )
-
-    write_deltalake(str(bronze_dir), data, mode="overwrite")
-    return bronze_dir
 
 
 def test_sqlglot_transpilation_duckdb_to_spark() -> None:
@@ -94,7 +54,7 @@ def test_router_respects_cli_force_override(sample_bronze_delta_table: Path) -> 
 
 
 def test_end_to_end_medallion_duckdb_contracts_and_microstructure(
-    sample_bronze_delta_table: Path, monkeypatch: pytest.MonkeyPatch
+    sample_bronze_delta_table: Path,
 ) -> None:
     """
     End-to-end integration test verifying:
@@ -102,14 +62,6 @@ def test_end_to_end_medallion_duckdb_contracts_and_microstructure(
     2. Gold microstructure calculations produce exact Mid-Price, OBI, and VWMP metrics.
     """
     lakehouse_root = sample_bronze_delta_table.parent.parent
-
-    # Redirect resolve_storage_target to use our isolated pytest tmp_path
-    def mock_resolve_storage(layer: str, table_name: str) -> tuple[str, dict[str, str]]:
-        target = lakehouse_root / layer / table_name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        return str(target), {}
-
-    monkeypatch.setattr("bifrost.pipeline.resolve_storage_target", mock_resolve_storage)
 
     # Execute pipeline on DuckDB fast path
     run_medallion_pipeline(force_engine="duckdb")

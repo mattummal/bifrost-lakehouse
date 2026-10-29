@@ -1,5 +1,7 @@
+import os
 import time
-from typing import Any
+from collections.abc import Mapping
+from pathlib import Path
 
 import duckdb
 import pyarrow as pa
@@ -14,51 +16,55 @@ from bifrost.router import BifrostRouter, resolve_storage_target
 console = Console()
 
 
-def run_bifrost_soda_validation(storage_options: dict[str, Any] | None = None) -> bool:
-    import os
+# Soda dataset name -> (medallion layer, Delta table name)
+SODA_CONTRACT_TABLES: dict[str, tuple[str, str]] = {
+    "bronze_orderbook_bbo": ("bronze", "orderbook_bbo"),
+    "silver_orderbook_validated": ("silver", "orderbook_validated"),
+    "gold_microstructure_1m": ("gold", "microstructure_1m"),
+}
 
-    db_path = "soda_eval.duckdb"
+DEFAULT_CONTRACT_PATH = Path(os.getenv("BIFROST_CONTRACT_PATH", "bifrost_contract.yml"))
 
-    if os.path.exists(db_path):
-        os.remove(db_path)
 
-    con = duckdb.connect(db_path)
-
-    bronze_dt = DeltaTable(".lakehouse_data/bronze/orderbook_bbo", storage_options=storage_options)
-    silver_dt = DeltaTable(".lakehouse_data/silver/orderbook_validated", storage_options=storage_options)
-    gold_dt = DeltaTable(".lakehouse_data/gold/microstructure_1m", storage_options=storage_options)
-
-    con.register("bronze_arrow", bronze_dt.to_pyarrow_dataset())
-    con.register("silver_arrow", silver_dt.to_pyarrow_dataset())
-    con.register("gold_arrow", gold_dt.to_pyarrow_dataset())
-
-    con.execute("CREATE OR REPLACE TABLE bronze_orderbook_bbo AS SELECT * FROM bronze_arrow")
-    con.execute("CREATE OR REPLACE TABLE silver_orderbook_validated AS SELECT * FROM silver_arrow")
-    con.execute("CREATE OR REPLACE TABLE gold_microstructure_1m AS SELECT * FROM gold_arrow")
-    con.close()
-
-    scan = Scan()
-    scan.set_data_source_name("bifrost_duckdb")
-
-    # Use 'path:' instead of 'database:'
-    config_yaml = f"""
-        data_source bifrost_duckdb:
-          type: duckdb
-          path: '{db_path}'
+def run_bifrost_soda_validation(
+    table_uris: Mapping[str, str] | None = None,
+    storage_options: dict[str, str] | None = None,
+    contract_path: str | Path = DEFAULT_CONTRACT_PATH,
+) -> bool:
     """
-    scan.add_configuration_yaml_str(config_yaml)
-    scan.add_sodacl_yaml_file("bifrost_contract.yml")
+    Runs the Soda contract against the Bronze, Silver and Gold Delta tables.
 
-    scan.execute()
-    print(scan.get_logs_text())
+    ``table_uris`` maps Soda dataset names to Delta table URIs; when omitted they are resolved
+    from the active storage backend (``BIFROST_STORAGE`` / ``BIFROST_DATA_DIR``).
+    """
+    if table_uris is None:
+        table_uris = {}
+        for dataset, (layer, table_name) in SODA_CONTRACT_TABLES.items():
+            table_uris[dataset], resolved_opts = resolve_storage_target(layer, table_name)
+            storage_options = storage_options or resolved_opts or None
 
-    # Clean up temporary database files
-    if os.path.exists(db_path):
-        os.remove(db_path)
-    if os.path.exists(f"{db_path}.wal"):
-        os.remove(f"{db_path}.wal")
+    missing = set(SODA_CONTRACT_TABLES) - set(table_uris)
+    if missing:
+        raise ValueError(f"Missing table URIs for contract datasets: {sorted(missing)}")
 
-    # Fail if there are execution errors or check failures
+    if not Path(contract_path).is_file():
+        raise FileNotFoundError(f"Soda contract not found: {contract_path}")
+
+    # Zero-copy views over the Delta tables in an in-memory DuckDB; nothing is materialised to disk.
+    con = duckdb.connect()
+    try:
+        for dataset, uri in table_uris.items():
+            con.register(dataset, DeltaTable(uri, storage_options=storage_options).to_pyarrow_dataset())
+
+        scan = Scan()
+        scan.set_data_source_name("bifrost_duckdb")
+        scan.add_duckdb_connection(con, data_source_name="bifrost_duckdb")
+        scan.add_sodacl_yaml_file(str(contract_path))
+        scan.execute()
+        print(scan.get_logs_text())
+    finally:
+        con.close()
+
     if scan.has_error_logs():
         return False
 
@@ -135,7 +141,14 @@ def run_medallion_pipeline(force_engine: str | None = None) -> None:
 
     # 4. Run Soda Core Multi-Tier Data Contracts across Bronze, Silver, and Gold
     console.print("\n[bold cyan]🔍 Executing Soda Core Data Contract Validation across all tiers...[/bold cyan]")
-    contracts_passed = run_bifrost_soda_validation(storage_options=storage_opts)
+    contracts_passed = run_bifrost_soda_validation(
+        table_uris={
+            "bronze_orderbook_bbo": bronze_uri,
+            "silver_orderbook_validated": silver_valid_uri,
+            "gold_microstructure_1m": gold_bars_uri,
+        },
+        storage_options=storage_opts or None,
+    )
 
     if not contracts_passed:
         raise RuntimeError("❌ Soda Core data contract validation failed! Check logs above.")
