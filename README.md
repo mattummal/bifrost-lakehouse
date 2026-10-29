@@ -13,7 +13,7 @@ Modern data platforms frequently suffer from two costly architectural anti-patte
 2. **Over-Provisioned Distributed Compute:** Organizations routinely default to heavy JVM/Spark clusters for all transformations regardless of dataset volume, paying minutes of cluster spin-up and shuffle overhead to process gigabytes of incremental data that fit comfortably in single-node memory.
 
 **`bifrost-lakehouse`** solves both problems through a hybrid **Rust + Python** Medallion architecture:
-* **Edge Micro-Batching in Rust:** Consumes live multi-asset Level-1 exchange orderbook streams (`BTCUSDT`, `ETHUSDT`, `SOLUSDT`), buffers events into zero-copy **Apache Arrow** columnar memory, and flushes compacted Parquet files with atomic **Delta Lake** transaction commits directly to Azure Data Lake Storage (ADLS Gen2) or local storage.
+* **Edge Micro-Batching in Rust:** Consumes live multi-asset Level-1 orderbook streams (Binance USD-M futures `@bookTicker`: `BTCUSDT`, `ETHUSDT`, `SOLUSDT`, stamped with the exchange transaction time), buffers events into zero-copy **Apache Arrow** columnar memory, and flushes compacted Parquet files with atomic **Delta Lake** transaction commits directly to Azure Data Lake Storage (ADLS Gen2) or local storage.
 * **Adaptive Compute Router in Python:** Inspects the Delta transaction log (`_delta_log`) metadata prior to execution—dynamically routing incremental workloads (< 25 GB) to an in-process **DuckDB** vectorized engine while reserving distributed **PySpark / Azure Databricks** clusters for massive historical backfills.
 
 ---
@@ -69,11 +69,13 @@ Rather than serializing incoming JSON messages into intermediate row-based buffe
 
 ### 2. Data Contracts & Financial Anomaly Quarantine (`src/bifrost/pipeline.py`)
 High-frequency financial feeds exhibit network jitter, dropped frames, and momentary exchange matching anomalies. At the **Bronze $\rightarrow$ Silver** boundary, strict expectations are enforced:
-* **Crossed-Book Filter:** Rejects ticks where $$Bid_{\mathrm{best}} \ge Ask_{\mathrm{best}}$$
-* **Dead-Letter Isolation:** Invalid records never halt the pipeline; they are atomically routed to `silver/orderbook_quarantine` with diagnostic metadata for post-mortem analysis.
+* **Crossed-Book Filter:** Rejects ticks where $$Bid_{\mathrm{best}} \ge Ask_{\mathrm{best}}$$, as well as non-positive, non-finite or null prices/quantities (`INVALID_ORDERBOOK`). Malformed numeric fields are dropped (and counted) at the Rust edge rather than coerced to zero.
+* **Replay De-duplication:** Repeated `(symbol, sequence_id)` ticks (e.g. after a reconnect) keep the earliest ingest; the rest are quarantined as `DUPLICATE_SEQUENCE`.
+* **Dead-Letter Isolation:** Invalid records never halt the pipeline; they are routed to `silver/orderbook_quarantine` with a `quarantine_reason`. Silver and quarantine are rebuilt together from the Bronze snapshot, so reruns are idempotent.
+* **Multi-Tier Contracts:** `bifrost_contract.yml` is validated with Soda Core against the same Bronze/Silver/Gold tables the run resolved (local, Azurite or ADLS), via zero-copy DuckDB views.
 
 ### 3. Market Microstructure Feature Engineering (`Gold Layer`)
-Downstream analytical transformations compute quantitative liquidity metrics across tumbling windows:
+Downstream analytical transformations compute quantitative liquidity metrics across 1-minute tumbling windows (bucketed in UTC on the exchange timestamp, independent of host timezone):
 
 * **Order Book Imbalance (OBI):** Quantifies top-of-book buying vs. selling pressure:
 
