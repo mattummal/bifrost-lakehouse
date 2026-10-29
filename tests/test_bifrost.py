@@ -1,12 +1,15 @@
+from datetime import datetime
 from pathlib import Path
 
 import duckdb
 import pyarrow as pa
+import pytest
 from deltalake import DeltaTable
 
 from bifrost.pipeline import run_medallion_pipeline
 from bifrost.query import get_gold_query
 from bifrost.router import BifrostRouter
+from tests.conftest import make_bronze_table, tick
 
 
 def test_sqlglot_transpilation_duckdb_to_spark() -> None:
@@ -16,8 +19,9 @@ def test_sqlglot_transpilation_duckdb_to_spark() -> None:
 
     assert "FROM silver_ticks" in duck_sql
     assert "FROM silver_ticks" in spark_sql
-    # Spark SQL rewrites to_timestamp(...) into CAST(FROM_UNIXTIME(...) AS TIMESTAMP)
-    assert "FROM_UNIXTIME" in spark_sql.upper()
+    # make_timestamp(µs) maps to Spark's TIMESTAMP_MICROS (no seconds truncation / string round-trip)
+    assert "TIMESTAMP_MICROS(EXCHANGE_TS_US)" in spark_sql.upper()
+    assert "FROM_UNIXTIME" not in spark_sql.upper()
     assert "AVG_VW_MICRO_PRICE" in spark_sql.upper()
 
 
@@ -51,6 +55,19 @@ def test_router_respects_cli_force_override(sample_bronze_delta_table: Path) -> 
 
     assert metrics.selected_engine == "pyspark"
     assert "Explicitly forced" in metrics.reason
+
+
+@pytest.mark.parametrize("session_tz", ["UTC", "Asia/Kolkata", "America/New_York"])
+def test_gold_windows_are_utc_regardless_of_session_timezone(session_tz: str) -> None:
+    """1m windows must bucket on UTC wall-clock, not the host/DuckDB session timezone."""
+    con = duckdb.connect()
+    con.execute(f"SET TimeZone = '{session_tz}'")
+    con.register("silver_ticks", make_bronze_table([tick("BTCUSDT", 1, 100.0, 1.0, 101.0, 1.0, 1729190000123456)]))
+
+    (window_start,) = con.execute(f"SELECT window_start FROM ({get_gold_query('duckdb')})").fetchone() or (None,)
+
+    # 1729190000.123456 s == 2024-10-17 18:33:20.123456 UTC
+    assert window_start == datetime(2024, 10, 17, 18, 33)
 
 
 def test_end_to_end_medallion_duckdb_contracts_and_microstructure(
