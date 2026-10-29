@@ -1,52 +1,16 @@
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import pyarrow as pa
 import pytest
-from deltalake import DeltaTable, write_deltalake
+from deltalake import DeltaTable
 
 from bifrost.pipeline import run_medallion_pipeline
 from bifrost.query import get_gold_query
 from bifrost.router import BifrostRouter
-
-
-@pytest.fixture
-def sample_bronze_delta_table(tmp_path: Path) -> Path:
-    """
-    Creates an isolated Bronze Delta table containing both valid orderbook ticks
-    and anomalous ticks (crossed book & zero quantity) to test quarantine contracts.
-    """
-    bronze_dir = tmp_path / "bronze" / "orderbook_bbo"
-    bronze_dir.mkdir(parents=True, exist_ok=True)
-
-    # 3 valid ticks + 2 invalid ticks (1 crossed book where bid >= ask, 1 zero qty)
-    data = pa.table(
-        {
-            "symbol": ["BTCUSDT", "BTCUSDT", "ETHUSDT", "BTCUSDT", "ETHUSDT"],
-            "update_id": [101, 102, 201, 103, 202],
-            "best_bid_price": [60000.0, 60010.0, 3000.0, 60050.0, 3000.0],
-            "best_bid_qty": [2.0, 3.0, 10.0, 1.0, 0.0],  # Row 4 has 0.0 bid qty (invalid)
-            "best_ask_price": [60010.0, 60020.0, 3003.0, 60000.0, 3001.0],  # Row 3 bid > ask (crossed)
-            "best_ask_qty": [2.0, 1.0, 10.0, 1.0, 5.0],
-            "exchange_ts_us": [
-                1729190000000000,
-                1729190010000000,
-                1729190015000000,
-                1729190020000000,
-                1729190025000000,
-            ],
-            "ingest_ts_us": [
-                1729190000001000,
-                1729190010001000,
-                1729190015001000,
-                1729190020001000,
-                1729190025001000,
-            ],
-        }
-    )
-
-    write_deltalake(str(bronze_dir), data, mode="overwrite")
-    return bronze_dir
+from tests.conftest import make_bronze_table, tick, write_bronze
 
 
 def test_sqlglot_transpilation_duckdb_to_spark() -> None:
@@ -56,8 +20,11 @@ def test_sqlglot_transpilation_duckdb_to_spark() -> None:
 
     assert "FROM silver_ticks" in duck_sql
     assert "FROM silver_ticks" in spark_sql
-    # Spark SQL rewrites to_timestamp(...) into CAST(FROM_UNIXTIME(...) AS TIMESTAMP)
-    assert "FROM_UNIXTIME" in spark_sql.upper()
+    # make_timestamp(µs) maps to Spark's TIMESTAMP_MICROS (no seconds truncation / string round-trip)
+    assert "TIMESTAMP_MICROS(EXCHANGE_TS_US)" in spark_sql.upper()
+    assert "FROM_UNIXTIME" not in spark_sql.upper()
+    # window_start must be NTZ in Spark to match the DuckDB/delta-rs Gold schema
+    assert "AS TIMESTAMP_NTZ) AS WINDOW_START" in spark_sql.upper()
     assert "AVG_VW_MICRO_PRICE" in spark_sql.upper()
 
 
@@ -93,8 +60,21 @@ def test_router_respects_cli_force_override(sample_bronze_delta_table: Path) -> 
     assert "Explicitly forced" in metrics.reason
 
 
+@pytest.mark.parametrize("session_tz", ["UTC", "Asia/Kolkata", "America/New_York"])
+def test_gold_windows_are_utc_regardless_of_session_timezone(session_tz: str) -> None:
+    """1m windows must bucket on UTC wall-clock, not the host/DuckDB session timezone."""
+    con = duckdb.connect()
+    con.execute(f"SET TimeZone = '{session_tz}'")
+    con.register("silver_ticks", make_bronze_table([tick("BTCUSDT", 1, 100.0, 1.0, 101.0, 1.0, 1729190000123456)]))
+
+    (window_start,) = con.execute(f"SELECT window_start FROM ({get_gold_query('duckdb')})").fetchone() or (None,)
+
+    # 1729190000.123456 s == 2024-10-17 18:33:20.123456 UTC
+    assert window_start == datetime(2024, 10, 17, 18, 33)
+
+
 def test_end_to_end_medallion_duckdb_contracts_and_microstructure(
-    sample_bronze_delta_table: Path, monkeypatch: pytest.MonkeyPatch
+    sample_bronze_delta_table: Path,
 ) -> None:
     """
     End-to-end integration test verifying:
@@ -102,14 +82,6 @@ def test_end_to_end_medallion_duckdb_contracts_and_microstructure(
     2. Gold microstructure calculations produce exact Mid-Price, OBI, and VWMP metrics.
     """
     lakehouse_root = sample_bronze_delta_table.parent.parent
-
-    # Redirect resolve_storage_target to use our isolated pytest tmp_path
-    def mock_resolve_storage(layer: str, table_name: str) -> tuple[str, dict[str, str]]:
-        target = lakehouse_root / layer / table_name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        return str(target), {}
-
-    monkeypatch.setattr("bifrost.pipeline.resolve_storage_target", mock_resolve_storage)
 
     # Execute pipeline on DuckDB fast path
     run_medallion_pipeline(force_engine="duckdb")
@@ -141,3 +113,77 @@ def test_end_to_end_medallion_duckdb_contracts_and_microstructure(
     assert avg_mid == 3001.5
     assert avg_vwmp == 3001.5
     assert avg_obi == 0.0
+
+
+def _read(lakehouse_root: Path, layer: str, table: str) -> dict[str, list[Any]]:
+    data: dict[str, list[Any]] = pa.table(DeltaTable(str(lakehouse_root / layer / table)).to_pyarrow_table()).to_pydict()
+    return data
+
+
+def test_quarantine_is_idempotent_across_reruns(sample_bronze_delta_table: Path) -> None:
+    """Re-running over the same Bronze snapshot must not accumulate duplicate quarantine rows."""
+    lakehouse_root = sample_bronze_delta_table.parent.parent
+
+    run_medallion_pipeline(force_engine="duckdb")
+    run_medallion_pipeline(force_engine="duckdb")
+
+    assert len(_read(lakehouse_root, "silver", "orderbook_validated")["symbol"]) == 3
+    assert len(_read(lakehouse_root, "silver", "orderbook_quarantine")["symbol"]) == 2
+
+
+def test_quarantine_is_cleared_when_bronze_becomes_clean(lakehouse_root: Path) -> None:
+    good = tick("BTCUSDT", 1, 100.0, 1.0, 101.0, 1.0, 1729190000000000)
+    crossed = tick("BTCUSDT", 2, 100.0, 1.0, 99.0, 1.0, 1729190001000000)
+
+    write_bronze(lakehouse_root, [good, crossed])
+    run_medallion_pipeline(force_engine="duckdb")
+    assert _read(lakehouse_root, "silver", "orderbook_quarantine")["sequence_id"] == [2]
+
+    write_bronze(lakehouse_root, [good])
+    run_medallion_pipeline(force_engine="duckdb")
+    assert _read(lakehouse_root, "silver", "orderbook_quarantine")["sequence_id"] == []
+
+
+def test_silver_deduplicates_replayed_sequence_ids(lakehouse_root: Path) -> None:
+    """Replayed (symbol, sequence_id) ticks keep the earliest ingest and quarantine the rest."""
+    ts = 1729190000000000
+    write_bronze(
+        lakehouse_root,
+        [
+            tick("BTCUSDT", 1, 100.0, 1.0, 101.0, 1.0, ts, ingest_lag_us=500),
+            tick("BTCUSDT", 1, 100.0, 1.0, 101.0, 1.0, ts, ingest_lag_us=9_000),  # replay after reconnect
+            tick("ETHUSDT", 1, 50.0, 1.0, 51.0, 1.0, ts),  # same id, different symbol: not a dup
+            tick("BTCUSDT", 2, 100.0, 1.0, 101.0, 1.0, ts + 1),
+        ],
+    )
+
+    run_medallion_pipeline(force_engine="duckdb")
+
+    silver = _read(lakehouse_root, "silver", "orderbook_validated")
+    assert sorted(zip(silver["symbol"], silver["sequence_id"], strict=True)) == [
+        ("BTCUSDT", 1),
+        ("BTCUSDT", 2),
+        ("ETHUSDT", 1),
+    ]
+    rows = zip(silver["symbol"], silver["sequence_id"], silver["ingest_ts_us"], strict=True)
+    assert [ingest for sym, seq, ingest in rows if (sym, seq) == ("BTCUSDT", 1)] == [ts + 500]
+
+    quarantine = _read(lakehouse_root, "silver", "orderbook_quarantine")
+    assert quarantine["quarantine_reason"] == ["DUPLICATE_SEQUENCE"]
+    assert quarantine["ingest_ts_us"] == [ts + 9_000]
+
+
+def test_non_finite_and_null_ticks_are_quarantined(lakehouse_root: Path) -> None:
+    ts = 1729190000000000
+    nan_tick = tick("BTCUSDT", 2, float("nan"), 1.0, 101.0, 1.0, ts)
+    inf_tick = tick("BTCUSDT", 3, 100.0, 1.0, float("inf"), 1.0, ts)
+    null_tick = tick("BTCUSDT", 4, 100.0, 1.0, 101.0, 1.0, ts)
+    null_tick["best_ask_qty"] = None
+    write_bronze(lakehouse_root, [tick("BTCUSDT", 1, 100.0, 1.0, 101.0, 1.0, ts), nan_tick, inf_tick, null_tick])
+
+    run_medallion_pipeline(force_engine="duckdb")
+
+    assert _read(lakehouse_root, "silver", "orderbook_validated")["sequence_id"] == [1]
+    quarantine = _read(lakehouse_root, "silver", "orderbook_quarantine")
+    assert sorted(quarantine["sequence_id"]) == [2, 3, 4]
+    assert set(quarantine["quarantine_reason"]) == {"INVALID_ORDERBOOK"}

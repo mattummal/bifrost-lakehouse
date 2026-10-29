@@ -1,10 +1,14 @@
 import sqlglot
 
-# Canonical Gold Microstructure Query authored in DuckDB dialect
+# Canonical Gold Microstructure Query authored in DuckDB dialect.
+# make_timestamp(µs) yields a naive UTC TIMESTAMP independent of the session TimeZone
+# (transpiles to Spark's TIMESTAMP_MICROS), so 1m windows don't shift with the host timezone.
+# The explicit ::TIMESTAMP is a no-op in DuckDB but becomes TIMESTAMP_NTZ in Spark, so both
+# engines write the same Delta type for window_start into the shared Gold table.
 CANONICAL_GOLD_MICROSTRUCTURE_SQL = """
 SELECT
     symbol,
-    DATE_TRUNC('minute', to_timestamp(exchange_ts_us / 1000000.0)::TIMESTAMP) AS window_start,
+    DATE_TRUNC('minute', make_timestamp(exchange_ts_us))::TIMESTAMP AS window_start,
     COUNT(*) AS tick_count,
     ROUND(AVG((best_bid_price + best_ask_price) / 2.0), 4) AS avg_mid_price,
     ROUND(AVG(

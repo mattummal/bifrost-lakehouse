@@ -22,7 +22,7 @@ transform:
 
 transform-spark:
 	@set -a; [ -f .env ] && . .env; set +a; \
-	uv run bifrost --engine=pyspark
+	uv run --extra spark bifrost --engine=pyspark
 
 test-rust:
 	cd crates/edge-ingester && cargo test

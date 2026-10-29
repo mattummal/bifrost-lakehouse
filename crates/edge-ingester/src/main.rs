@@ -1,7 +1,7 @@
 // Implement the Live WebSocket + Delta Lake Writer (src/main.rs)
-// This connects to the live Binance @bookTicker / @depth stream for
+// This connects to the live Binance USD-M futures @bookTicker stream for
 // BTCUSDT, ETHUSDT, and SOLUSDT, micro-batches events in memory, and
-// commits compacted Parquet files + _delta_log transactions directly to local Azurite.
+// commits compacted Parquet files + _delta_log transactions to the configured storage.
 //----------------------------------------------
 // automatically creates and writes to
 // .lakehouse_data/bronze/orderbook_bbo by default,
@@ -11,7 +11,7 @@ mod arrow_buffer;
 
 use std::collections::HashMap;
 use std::time::Duration;
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use arrow_buffer::{ArrowOrderbookBuffer, OrderbookTick};
 use chrono::Utc;
 use deltalake::operations::DeltaOps;
@@ -20,10 +20,12 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use tokio::time::interval;
 use tokio_tungstenite::connect_async;
-use tracing::info;
+use tokio_tungstenite::tungstenite::Message;
+use tracing::{info, warn};
 
+// USD-M futures bookTicker carries exchange timestamps (E/T); the spot stream does not.
 const BINANCE_WS_URL: &str =
-    "wss://stream.binance.com:9443/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker/solusdt@bookTicker";
+    "wss://fstream.binance.com/public/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker/solusdt@bookTicker";
 const BATCH_SIZE_THRESHOLD: usize = 500;
 const FLUSH_INTERVAL_SECS: u64 = 10;
 
@@ -38,6 +40,9 @@ struct BookTickerEvent {
     update_id: u64,
     #[serde(rename = "s")]
     symbol: String,
+    /// Matching-engine transaction time (ms since epoch).
+    #[serde(rename = "T")]
+    transaction_time_ms: i64,
     #[serde(rename = "b")]
     best_bid_price: String,
     #[serde(rename = "B")]
@@ -46,6 +51,39 @@ struct BookTickerEvent {
     best_ask_price: String,
     #[serde(rename = "A")]
     best_ask_qty: String,
+}
+
+fn parse_price_or_qty(field: &str, raw: &str) -> Result<f64> {
+    let value: f64 = raw
+        .parse()
+        .with_context(|| format!("field `{field}` is not a number: {raw:?}"))?;
+    if !value.is_finite() {
+        bail!("field `{field}` is not finite: {raw:?}");
+    }
+    Ok(value)
+}
+
+/// Parses a combined-stream bookTicker message into a tick. Malformed numeric fields are
+/// rejected rather than coerced, so they surface as parse errors instead of fake quarantine rows.
+fn parse_tick(text: &str, ingest_ts_us: i64) -> Result<OrderbookTick> {
+    let ev = serde_json::from_str::<CombinedStreamWrapper>(text)
+        .context("invalid bookTicker payload")?
+        .data;
+    let exchange_ts_us = ev
+        .transaction_time_ms
+        .checked_mul(1_000)
+        .context("transaction time overflows microseconds")?;
+
+    Ok(OrderbookTick {
+        exchange_ts_us,
+        ingest_ts_us,
+        best_bid_price: parse_price_or_qty("b", &ev.best_bid_price)?,
+        best_bid_qty: parse_price_or_qty("B", &ev.best_bid_qty)?,
+        best_ask_price: parse_price_or_qty("a", &ev.best_ask_price)?,
+        best_ask_qty: parse_price_or_qty("A", &ev.best_ask_qty)?,
+        symbol: ev.symbol,
+        sequence_id: ev.update_id,
+    })
 }
 
 fn azurite_storage_options() -> HashMap<String, String> {
@@ -106,30 +144,22 @@ async fn main() -> Result<()> {
 
     info!("Ingesting live ticks into Arrow memory buffer...");
 
+    let mut parse_errors: u64 = 0;
+
     loop {
         tokio::select! {
             Some(msg) = read.next() => {
-                if let Ok(tungstenite_msg) = msg {
-                    if let Ok(text) = tungstenite_msg.into_text() {
-                        if let Ok(wrapper) = serde_json::from_str::<CombinedStreamWrapper>(&text) {
-                            let ev = wrapper.data;
-                            let now_us = Utc::now().timestamp_micros();
-
-                            let tick = OrderbookTick {
-                                exchange_ts_us: now_us,
-                                ingest_ts_us: now_us,
-                                symbol: ev.symbol,
-                                sequence_id: ev.update_id,
-                                best_bid_price: ev.best_bid_price.parse().unwrap_or(0.0),
-                                best_bid_qty: ev.best_bid_qty.parse().unwrap_or(0.0),
-                                best_ask_price: ev.best_ask_price.parse().unwrap_or(0.0),
-                                best_ask_qty: ev.best_ask_qty.parse().unwrap_or(0.0),
-                            };
+                if let Ok(Message::Text(text)) = msg {
+                    match parse_tick(&text, Utc::now().timestamp_micros()) {
+                        Ok(tick) => {
                             buffer.push(&tick);
-
                             if buffer.len() >= BATCH_SIZE_THRESHOLD {
                                 flush_to_delta(&mut buffer, &table_uri, &storage_opts).await?;
                             }
+                        }
+                        Err(err) => {
+                            parse_errors += 1;
+                            warn!(parse_errors, "Dropping unparseable tick: {err:#}");
                         }
                     }
                 }
@@ -169,4 +199,42 @@ async fn flush_to_delta(
         table_uri
     );
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = r#"{"stream":"btcusdt@bookTicker","data":{"e":"bookTicker","u":11959768037182,"s":"BTCUSDT","ps":"BTCUSDT","b":"80677.10","B":"6.597","a":"80677.20","A":"1.951","T":1793296313365,"E":1793296313366,"st":1}}"#;
+
+    #[test]
+    fn parses_futures_book_ticker_with_exchange_time() {
+        let tick = parse_tick(SAMPLE, 42).expect("valid payload");
+        assert_eq!(tick.symbol, "BTCUSDT");
+        assert_eq!(tick.sequence_id, 11959768037182);
+        assert_eq!(tick.exchange_ts_us, 1793296313365000);
+        assert_eq!(tick.ingest_ts_us, 42);
+        assert_eq!(tick.best_bid_price, 80677.10);
+        assert_eq!(tick.best_bid_qty, 6.597);
+        assert_eq!(tick.best_ask_price, 80677.20);
+        assert_eq!(tick.best_ask_qty, 1.951);
+    }
+
+    #[test]
+    fn rejects_malformed_numbers_instead_of_zeroing() {
+        let bad = SAMPLE.replace(r#""b":"80677.10""#, r#""b":"oops""#);
+        let err = parse_tick(&bad, 0).unwrap_err();
+        assert!(format!("{err:#}").contains("`b`"));
+    }
+
+    #[test]
+    fn rejects_non_finite_numbers() {
+        let bad = SAMPLE.replace(r#""A":"1.951""#, r#""A":"NaN""#);
+        assert!(parse_tick(&bad, 0).is_err());
+    }
+
+    #[test]
+    fn rejects_payload_without_exchange_time() {
+        let spot = SAMPLE.replace(r#""T":1793296313365,"#, "");
+        assert!(parse_tick(&spot, 0).is_err());
+    }
 }

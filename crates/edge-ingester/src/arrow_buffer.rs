@@ -10,6 +10,7 @@ use deltalake::arrow::datatypes::{DataType, Field, Schema};
 use deltalake::arrow::record_batch::RecordBatch;
 use anyhow::Result;
 
+#[derive(Debug)]
 pub struct OrderbookTick {
     pub exchange_ts_us: i64,
     pub ingest_ts_us: i64,
