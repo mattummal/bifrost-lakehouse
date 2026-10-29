@@ -92,8 +92,8 @@ class SparkEngine:
         console.print("[cyan]Executing Microstructure Aggregations via Spark SQL...[/cyan]")
         df_gold = spark.sql(spark_sql)
 
-        # Write Delta Lake Gold table
-        df_gold.write.format("delta").mode("overwrite").save(gold_bars_uri)
+        # Gold is fully rebuilt each run; overwrite the schema like the DuckDB path does.
+        df_gold.write.format("delta").mode("overwrite").option("overwriteSchema", "true").save(gold_bars_uri)
 
         elapsed_ms = (time.perf_counter() - t0) * 1000
         console.print(

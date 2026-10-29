@@ -23,6 +23,8 @@ def test_sqlglot_transpilation_duckdb_to_spark() -> None:
     # make_timestamp(µs) maps to Spark's TIMESTAMP_MICROS (no seconds truncation / string round-trip)
     assert "TIMESTAMP_MICROS(EXCHANGE_TS_US)" in spark_sql.upper()
     assert "FROM_UNIXTIME" not in spark_sql.upper()
+    # window_start must be NTZ in Spark to match the DuckDB/delta-rs Gold schema
+    assert "AS TIMESTAMP_NTZ) AS WINDOW_START" in spark_sql.upper()
     assert "AVG_VW_MICRO_PRICE" in spark_sql.upper()
 
 
