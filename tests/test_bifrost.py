@@ -140,3 +140,48 @@ def test_quarantine_is_cleared_when_bronze_becomes_clean(lakehouse_root: Path) -
     write_bronze(lakehouse_root, [good])
     run_medallion_pipeline(force_engine="duckdb")
     assert _read(lakehouse_root, "silver", "orderbook_quarantine")["sequence_id"] == []
+
+
+def test_silver_deduplicates_replayed_sequence_ids(lakehouse_root: Path) -> None:
+    """Replayed (symbol, sequence_id) ticks keep the earliest ingest and quarantine the rest."""
+    ts = 1729190000000000
+    write_bronze(
+        lakehouse_root,
+        [
+            tick("BTCUSDT", 1, 100.0, 1.0, 101.0, 1.0, ts, ingest_lag_us=500),
+            tick("BTCUSDT", 1, 100.0, 1.0, 101.0, 1.0, ts, ingest_lag_us=9_000),  # replay after reconnect
+            tick("ETHUSDT", 1, 50.0, 1.0, 51.0, 1.0, ts),  # same id, different symbol: not a dup
+            tick("BTCUSDT", 2, 100.0, 1.0, 101.0, 1.0, ts + 1),
+        ],
+    )
+
+    run_medallion_pipeline(force_engine="duckdb")
+
+    silver = _read(lakehouse_root, "silver", "orderbook_validated")
+    assert sorted(zip(silver["symbol"], silver["sequence_id"], strict=True)) == [
+        ("BTCUSDT", 1),
+        ("BTCUSDT", 2),
+        ("ETHUSDT", 1),
+    ]
+    rows = zip(silver["symbol"], silver["sequence_id"], silver["ingest_ts_us"], strict=True)
+    assert [ingest for sym, seq, ingest in rows if (sym, seq) == ("BTCUSDT", 1)] == [ts + 500]
+
+    quarantine = _read(lakehouse_root, "silver", "orderbook_quarantine")
+    assert quarantine["quarantine_reason"] == ["DUPLICATE_SEQUENCE"]
+    assert quarantine["ingest_ts_us"] == [ts + 9_000]
+
+
+def test_non_finite_and_null_ticks_are_quarantined(lakehouse_root: Path) -> None:
+    ts = 1729190000000000
+    nan_tick = tick("BTCUSDT", 2, float("nan"), 1.0, 101.0, 1.0, ts)
+    inf_tick = tick("BTCUSDT", 3, 100.0, 1.0, float("inf"), 1.0, ts)
+    null_tick = tick("BTCUSDT", 4, 100.0, 1.0, 101.0, 1.0, ts)
+    null_tick["best_ask_qty"] = None
+    write_bronze(lakehouse_root, [tick("BTCUSDT", 1, 100.0, 1.0, 101.0, 1.0, ts), nan_tick, inf_tick, null_tick])
+
+    run_medallion_pipeline(force_engine="duckdb")
+
+    assert _read(lakehouse_root, "silver", "orderbook_validated")["sequence_id"] == [1]
+    quarantine = _read(lakehouse_root, "silver", "orderbook_quarantine")
+    assert sorted(quarantine["sequence_id"]) == [2, 3, 4]
+    assert set(quarantine["quarantine_reason"]) == {"INVALID_ORDERBOOK"}

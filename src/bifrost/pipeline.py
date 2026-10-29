@@ -25,6 +25,37 @@ SODA_CONTRACT_TABLES: dict[str, tuple[str, str]] = {
 
 DEFAULT_CONTRACT_PATH = Path(os.getenv("BIFROST_CONTRACT_PATH", "bifrost_contract.yml"))
 
+# A tick is tradeable only if both sides are finite, positive, and the book is uncrossed.
+# COALESCE treats NULL predicates as invalid instead of letting them slip through.
+_VALID_BOOK_PREDICATE = """
+    COALESCE(
+        isfinite(best_bid_price) AND isfinite(best_ask_price)
+        AND isfinite(best_bid_qty) AND isfinite(best_ask_qty)
+        AND best_bid_price > 0 AND best_ask_price > best_bid_price
+        AND best_bid_qty > 0 AND best_ask_qty > 0,
+        FALSE
+    )
+"""
+
+SILVER_CLASSIFY_SQL = f"""
+    SELECT
+        * EXCLUDE (is_valid, dup_rank),
+        CASE
+            WHEN NOT is_valid THEN 'INVALID_ORDERBOOK'
+            WHEN dup_rank > 1 THEN 'DUPLICATE_SEQUENCE'
+        END AS quarantine_reason
+    FROM (
+        SELECT
+            *,
+            {_VALID_BOOK_PREDICATE} AS is_valid,
+            ROW_NUMBER() OVER (
+                PARTITION BY symbol, sequence_id, {_VALID_BOOK_PREDICATE}
+                ORDER BY ingest_ts_us, exchange_ts_us
+            ) AS dup_rank
+        FROM bronze_ticks
+    )
+"""
+
 
 def run_bifrost_soda_validation(
     table_uris: Mapping[str, str] | None = None,
@@ -89,19 +120,16 @@ def run_medallion_pipeline(force_engine: str | None = None) -> None:
 
     con = duckdb.connect()
     con.register("bronze_ticks", bronze_arrow)
+    con.execute(f"CREATE TEMP TABLE classified_ticks AS {SILVER_CLASSIFY_SQL}")
 
     valid_arrow = con.execute("""
-        SELECT *, (best_bid_price + best_ask_price) / 2.0 AS mid_price
-        FROM bronze_ticks
-        WHERE best_bid_price > 0 AND best_ask_price > best_bid_price
-          AND best_bid_qty > 0 AND best_ask_qty > 0
+        SELECT * EXCLUDE (quarantine_reason), (best_bid_price + best_ask_price) / 2.0 AS mid_price
+        FROM classified_ticks
+        WHERE quarantine_reason IS NULL
     """).to_arrow_table()
 
     quarantine_arrow = con.execute("""
-        SELECT *, 'INVALID_ORDERBOOK' AS quarantine_reason
-        FROM bronze_ticks
-        WHERE NOT (best_bid_price > 0 AND best_ask_price > best_bid_price
-                   AND best_bid_qty > 0 AND best_ask_qty > 0)
+        SELECT * FROM classified_ticks WHERE quarantine_reason IS NOT NULL
     """).to_arrow_table()
 
     # Silver is rebuilt from the full Bronze snapshot, so quarantine is overwritten in lockstep
