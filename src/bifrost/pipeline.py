@@ -104,9 +104,16 @@ def run_medallion_pipeline(force_engine: str | None = None) -> None:
                    AND best_bid_qty > 0 AND best_ask_qty > 0)
     """).to_arrow_table()
 
-    write_deltalake(silver_valid_uri, valid_arrow, mode="overwrite", storage_options=storage_opts)
-    if quarantine_arrow.num_rows > 0:
-        write_deltalake(silver_quarantine_uri, quarantine_arrow, mode="append", storage_options=storage_opts)
+    # Silver is rebuilt from the full Bronze snapshot, so quarantine is overwritten in lockstep
+    # (even when empty) to keep reruns idempotent.
+    write_deltalake(silver_valid_uri, valid_arrow, mode="overwrite", schema_mode="overwrite", storage_options=storage_opts)
+    write_deltalake(
+        silver_quarantine_uri,
+        quarantine_arrow,
+        mode="overwrite",
+        schema_mode="overwrite",
+        storage_options=storage_opts,
+    )
 
     console.print(
         f"[green]✓ Silver Contract Enforced:[/green] {valid_arrow.num_rows} valid rows | "

@@ -1,5 +1,6 @@
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import duckdb
 import pyarrow as pa
@@ -9,7 +10,7 @@ from deltalake import DeltaTable
 from bifrost.pipeline import run_medallion_pipeline
 from bifrost.query import get_gold_query
 from bifrost.router import BifrostRouter
-from tests.conftest import make_bronze_table, tick
+from tests.conftest import make_bronze_table, tick, write_bronze
 
 
 def test_sqlglot_transpilation_duckdb_to_spark() -> None:
@@ -110,3 +111,32 @@ def test_end_to_end_medallion_duckdb_contracts_and_microstructure(
     assert avg_mid == 3001.5
     assert avg_vwmp == 3001.5
     assert avg_obi == 0.0
+
+
+def _read(lakehouse_root: Path, layer: str, table: str) -> dict[str, list[Any]]:
+    data: dict[str, list[Any]] = pa.table(DeltaTable(str(lakehouse_root / layer / table)).to_pyarrow_table()).to_pydict()
+    return data
+
+
+def test_quarantine_is_idempotent_across_reruns(sample_bronze_delta_table: Path) -> None:
+    """Re-running over the same Bronze snapshot must not accumulate duplicate quarantine rows."""
+    lakehouse_root = sample_bronze_delta_table.parent.parent
+
+    run_medallion_pipeline(force_engine="duckdb")
+    run_medallion_pipeline(force_engine="duckdb")
+
+    assert len(_read(lakehouse_root, "silver", "orderbook_validated")["symbol"]) == 3
+    assert len(_read(lakehouse_root, "silver", "orderbook_quarantine")["symbol"]) == 2
+
+
+def test_quarantine_is_cleared_when_bronze_becomes_clean(lakehouse_root: Path) -> None:
+    good = tick("BTCUSDT", 1, 100.0, 1.0, 101.0, 1.0, 1729190000000000)
+    crossed = tick("BTCUSDT", 2, 100.0, 1.0, 99.0, 1.0, 1729190001000000)
+
+    write_bronze(lakehouse_root, [good, crossed])
+    run_medallion_pipeline(force_engine="duckdb")
+    assert _read(lakehouse_root, "silver", "orderbook_quarantine")["sequence_id"] == [2]
+
+    write_bronze(lakehouse_root, [good])
+    run_medallion_pipeline(force_engine="duckdb")
+    assert _read(lakehouse_root, "silver", "orderbook_quarantine")["sequence_id"] == []
