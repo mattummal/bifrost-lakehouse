@@ -1,7 +1,7 @@
 // Implement the Live WebSocket + Delta Lake Writer (src/main.rs)
-// This connects to the live Binance @bookTicker / @depth stream for
+// This connects to the live Binance USD-M futures @bookTicker stream for
 // BTCUSDT, ETHUSDT, and SOLUSDT, micro-batches events in memory, and
-// commits compacted Parquet files + _delta_log transactions directly to local Azurite.
+// commits compacted Parquet files + _delta_log transactions to the configured storage.
 //----------------------------------------------
 // automatically creates and writes to
 // .lakehouse_data/bronze/orderbook_bbo by default,
@@ -22,8 +22,9 @@ use tokio::time::interval;
 use tokio_tungstenite::connect_async;
 use tracing::info;
 
+// USD-M futures bookTicker carries exchange timestamps (E/T); the spot stream does not.
 const BINANCE_WS_URL: &str =
-    "wss://stream.binance.com:9443/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker/solusdt@bookTicker";
+    "wss://fstream.binance.com/public/stream?streams=btcusdt@bookTicker/ethusdt@bookTicker/solusdt@bookTicker";
 const BATCH_SIZE_THRESHOLD: usize = 500;
 const FLUSH_INTERVAL_SECS: u64 = 10;
 
@@ -38,6 +39,9 @@ struct BookTickerEvent {
     update_id: u64,
     #[serde(rename = "s")]
     symbol: String,
+    /// Matching-engine transaction time (ms since epoch).
+    #[serde(rename = "T")]
+    transaction_time_ms: i64,
     #[serde(rename = "b")]
     best_bid_price: String,
     #[serde(rename = "B")]
@@ -116,7 +120,7 @@ async fn main() -> Result<()> {
                             let now_us = Utc::now().timestamp_micros();
 
                             let tick = OrderbookTick {
-                                exchange_ts_us: now_us,
+                                exchange_ts_us: ev.transaction_time_ms * 1_000,
                                 ingest_ts_us: now_us,
                                 symbol: ev.symbol,
                                 sequence_id: ev.update_id,
